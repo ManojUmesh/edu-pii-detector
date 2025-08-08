@@ -1,0 +1,7 @@
+tensorflow==2.19.0
+tensorflow-text==2.19.0
+keras==3.3.3
+keras-nlp==0.13.0
+numpy
+scikit-learn
+tqdm
