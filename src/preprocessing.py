@@ -3,14 +3,15 @@ import numpy as np
 import tensorflow as tf
 import keras
 import keras_nlp
-import keras_nlp
 from sklearn.model_selection import train_test_split
 from config import ModelConfiguration, configure_logging
 
 # Setup logging
 logging = configure_logging()
 
+# -----------------------------
 # Step 1: Read raw data
+# -----------------------------
 def read_data(data_path):
     """
     Reads JSON file and converts tokens and labels into NumPy arrays.
@@ -29,7 +30,9 @@ def read_data(data_path):
 
     return words, labels
 
+# -----------------------------
 # Step 2: Tokenizer configuration
+# -----------------------------
 def tokenizer_conf():
     """
     Loads the DeBERTa tokenizer from preset defined in ModelConfiguration.
@@ -37,20 +40,42 @@ def tokenizer_conf():
     logging.info("Creating tokenizer ...")
     return keras_nlp.models.DebertaV3Tokenizer.from_preset(ModelConfiguration.preset)
 
-# Step 3: Simple tokenization and dataset creation
+# -----------------------------
+# Step 3: Minimal dataset builder
+# -----------------------------
 def build_dataset(words, labels=None, batch_size=4, seq_len=128, shuffle=False):
     """
     Converts words (and labels if provided) into a tf.data.Dataset.
-    This version is minimal — no special tokens or complex alignment yet.
+    Minimal version: joins words into a string, tokenizes, pads/truncates.
+    No subword alignment yet.
     """
-    logging.info("Building dataset ...")
     tokenizer = tokenizer_conf()
 
     def encode(example):
-        tokens = tokenizer(example["words"]).to_tensor(shape=(seq_len,))
+        # Join words into a single string
+        text = tf.strings.reduce_join(example["words"], separator=" ")
+
+        # Tokenize text → dense tensor
+        ids = tokenizer(text)
+        if isinstance(ids, tf.RaggedTensor):
+            ids = ids.to_tensor()
+        ids = tf.squeeze(ids)
+
+        # Truncate and pad to seq_len
+        ids = ids[:seq_len]
+        pad_len = tf.maximum(0, seq_len - tf.shape(ids)[0])
+        ids = tf.pad(ids, paddings=[[0, pad_len]])
+
+        inputs = {"token_ids": ids}
+
         if labels is not None:
-            return {"token_ids": tokens}, example["labels"]
-        return {"token_ids": tokens}
+            lbl = example["labels"]
+            lbl = lbl[:seq_len]
+            lbl = tf.pad(lbl, paddings=[[0, tf.maximum(0, seq_len - tf.shape(lbl)[0])]],
+                         constant_values=-100)
+            return inputs, lbl
+
+        return inputs
 
     slices = {"words": tf.ragged.constant(words)}
     if labels is not None:
@@ -59,16 +84,17 @@ def build_dataset(words, labels=None, batch_size=4, seq_len=128, shuffle=False):
     ds = tf.data.Dataset.from_tensor_slices(slices)
     ds = ds.map(encode, num_parallel_calls=tf.data.AUTOTUNE)
     if shuffle:
-        ds = ds.shuffle(buffer_size=1024, seed=ModelConfiguration.seed)
+        ds = ds.shuffle(1024, seed=ModelConfiguration.seed)
     ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
     return ds
 
+# -----------------------------
 # Step 4: Wrapper function
+# -----------------------------
 def preprocess_data(data_path):
     """
     Main preprocessing entry point.
-    Returns train/valid datasets if in training mode,
-    otherwise returns dataset for inference.
+    Returns train/valid datasets if in training mode.
     """
     keras.utils.set_random_seed(ModelConfiguration.seed)
 
