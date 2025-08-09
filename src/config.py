@@ -12,6 +12,11 @@ def configure_logging():
     )
     return logging
 
+# Class to define input data paths
+class InputData:
+    train = "input/train.json"
+    test = "input/test.json"
+
 # Configuration parameters for the model
 class ModelConfiguration:
     seed = 2024
