@@ -1,3 +1,4 @@
 input/
 .venv/
-logfile.log/
+logfile.log
+src/__pycache__/
