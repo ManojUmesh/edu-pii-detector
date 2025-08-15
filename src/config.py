@@ -25,7 +25,12 @@ class ModelConfiguration:
     train_batch_size = 8            # size of input batch
     infer_seq_len = 2000            # max size of input sequence for inference
     infer_batch_size = 2            # size of input batch in inference
+    epochs = 6                      # number of epochs to train
+    lr_mode = 'exp'                 # or 'cos' or 'step'
     
     labels = ['B-USERNAME', 'B-ID_NUM', 'I-PHONE_NUM', 'I-ID_NUM', 'I-NAME_STUDENT', 'B-EMAIL', 'I-STREET_ADDRESS', 'B-STREET_ADDRESS', 'B-URL_PERSONAL', 'O', 'I-URL_PERSONAL', 'B-PHONE_NUM', 'B-NAME_STUDENT']
     id2label = dict(enumerate(labels))  # integer values for BIO mapping
     label2id = {value:key for key,value in id2label.items()}
+    num_labels = len(labels)        # number of PII tags
+    
+    train = True                   # whether to train or use already trained 

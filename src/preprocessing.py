@@ -1,7 +1,7 @@
 import json
 import numpy as np
 import tensorflow as tf
-from tqdm.notebook import tqdm
+from tqdm.auto import tqdm
 import keras
 import keras_nlp
 from keras import ops
@@ -60,25 +60,16 @@ def packer_conf():
         raise
 
 # get tokens from words
-def get_tokens(words, seq_len):
-    try:
-        logging.info("PREPROCESSING: Getting tokens ...")
-        tokenizer = tokenizer_conf()
-        packer = packer_conf()
-        # Tokenize input
-        token_words = tf.expand_dims(
-            tokenizer(words), axis=-1
-        )  # ex: (words) ["It's", "a", "cat"] ->  (token_words) [[1, 2], [3], [4]]
-        tokens = tf.reshape(
-            token_words, [-1]
-        )  # ex: (token_words) [[1, 2], [3], [4]] -> (tokens) [1, 2, 3, 4]
-        # Pad tokens
-        tokens = packer(tokens)[0][:seq_len]
-        inputs = {"token_ids": tokens, "padding_mask": tokens != 0}
-        return inputs, tokens, token_words
-    except Exception as e:
-        logging.error(f"Error: Please check if the *get_tokens() preprocessing.py* exists and work properly. \n{e}")
-        raise
+def get_tokens(words, seq_len, tokenizer, packer):
+    # Tokenize input -> ragged per-word tokens
+    token_words = tf.expand_dims(tokenizer(words), axis=-1)
+    tokens = tf.reshape(token_words, [-1])
+    tokens = packer(tokens)[0][:seq_len]
+    inputs = {"token_ids": tokens, "padding_mask": tokens != 0}
+    return inputs, tokens, token_words
+    #except Exception as e:
+      #  logging.error(f"Error: Please check if the *get_tokens() preprocessing.py* exists and work properly. \n{e}")
+       # raise
 
 # get token ids for tokens
 def get_token_ids(token_words):
@@ -132,9 +123,8 @@ def process_token_ids(token_ids, seq_len):
 
 # tokenize text
 def process_data(seq_len=720, has_label=True, return_ids=False):
-    try:    
-        tokenizer = tokenizer_conf()
-        # To add spetical tokens: [CLS], [SEP], [PAD]
+    try:
+        tokenizer = tokenizer_conf()  # EAGER creation
         packer = keras_nlp.layers.MultiSegmentPacker(
             start_value=tokenizer.cls_token_id,
             end_value=tokenizer.sep_token_id,
@@ -142,18 +132,14 @@ def process_data(seq_len=720, has_label=True, return_ids=False):
         )
 
         def process(x):
-            try:    
-                logging.info("PREPROCESSING: Processing data ...")
-                # Generate inputs from tokens
-                inputs, tokens, words_int = get_tokens(x["words"], seq_len, packer)
-                # Generate token_ids for maping tokens to words
+            try:
+                # pass tokenizer & packer into get_tokens
+                inputs, tokens, words_int = get_tokens(x["words"], seq_len, tokenizer, packer)
                 token_ids = get_token_ids(words_int)
                 if has_label:
-                    # Generate token_labels from word_labels
                     token_labels = get_token_labels(x["labels"], token_ids, seq_len)
                     return inputs, token_labels
                 elif return_ids:
-                    # Pad token_ids to align with tokens
                     token_ids = process_token_ids(token_ids, seq_len)
                     return token_ids
                 else:
@@ -204,7 +190,7 @@ def preprocess_data(data_path):
         keras.mixed_precision.set_global_policy("mixed_float16")  # enable larger batch sizes and faster training
 
         # read data
-        words, labels = read_data(data_path, ModelConfiguration)
+        words, labels = read_data(data_path)
 
         if ModelConfiguration.train:
             # split the data
