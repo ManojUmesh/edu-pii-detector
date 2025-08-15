@@ -3,3 +3,7 @@ input/
 __pycache__/
 *.pyc
 logfile.log
+# ignore trained models
+models/
+*.keras
+*.h5

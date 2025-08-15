@@ -14,8 +14,8 @@ def configure_logging():
 
 # Class to define input data paths
 class InputData:
-    train = "input/train.json"
-    test = "input/test.json"
+    train = "/content/drive/MyDrive/Colab Notebooks/PII-Data-Detection/input/train.json"
+    test = "/content/drive/MyDrive/Colab Notebooks/PII-Data-Detection/input/test.json"
 
 # Configuration parameters for the model
 class ModelConfiguration:
