@@ -1,223 +1,285 @@
 import json
+from typing import List, Tuple, Optional
+from collections import Counter
+
 import numpy as np
 import tensorflow as tf
-from tqdm.auto import tqdm
 import keras
 import keras_nlp
-from keras import ops
 from sklearn.model_selection import train_test_split
-from config import ModelConfiguration, configure_logging
+from tqdm.auto import tqdm
 
-# Setup logging
+from config import ModelConfiguration, InputData, configure_logging
+
+# Logging & (optional) mixed precision
+
 logging = configure_logging()
+try:
+    keras.mixed_precision.set_global_policy("mixed_float16")
+except Exception:
+    pass
 
-# Read raw data
-def read_data(data_path):
-    try:
-        # Initialize empty arrays
-        logging.info("PREPROCESSING: Reading data ...")
-        data = json.load(open(data_path))
+# I/O: read JSON data
 
-        words = np.empty(len(data), dtype=object)
-        labels = np.empty(len(data), dtype=object)
+def read_data(path: str) -> Tuple[List[List[str]], Optional[List[List[str]]]]:
+    """
+    Read a JSON file that contains a list of records.
+      Train JSON: [{"tokens": [...], "labels": [...]}, ...]
+      Test  JSON: [{"tokens": [...]}, ...]  (no "labels" key)
+    Returns:
+      words:  List[List[str]]
+      labels: List[List[str]] | None
+    """
+    logging.info("PREPROCESSING: Reading data ...")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-        # Fill the arrays
-        for i, x in tqdm(enumerate(data), total=len(data)):
-            words[i] = np.array(x["tokens"])
-            labels[i] = np.array([ModelConfiguration.label2id[label] for label in x["labels"]])
+    words: List[List[str]] = []
+    labels: Optional[List[List[str]]] = []
 
-        return words, labels
-    except Exception as e:
-        logging.error(f"Error: Please check if the *read_data() preprocessing.py* exists and work properly. \n{e}")
-        raise
+    has_labels = isinstance(data, list) and len(data) > 0 and ("labels" in data[0])
 
-# create tokenizer
+    for x in tqdm(data, total=len(data)):
+        words.append(x["tokens"])
+        if has_labels:
+            labels.append(x["labels"])
+
+    if not has_labels:
+        labels = None
+
+    return words, labels
+
+# Tokenizer
+
 def tokenizer_conf():
-    try:
-        # To convert string input or list of strings input to numerical tokens
-        logging.info("PREPROCESSING: Creating tokenizer ...")
-        tokenizer = keras_nlp.models.DebertaV3Tokenizer.from_preset(
-            ModelConfiguration.preset,
-        )
-        return tokenizer
-    except Exception as e:
-        logging.error(f"Error: Please check if the *tokenizer_conf() preprocessing.py* exists and work properly. \n{e}")
-        raise
-# create packer
-def packer_conf():
-    try:    
-        tokenizer = tokenizer_conf()
-        # Preprocessing layer to add spetical tokens: [CLS], [SEP], [PAD]
-        logging.info("PREPROCESSING: Creating packer ...")
-        packer = keras_nlp.layers.MultiSegmentPacker(
-            start_value=tokenizer.cls_token_id,
-            end_value=tokenizer.sep_token_id,
-            sequence_length=10,
-        )
-        return packer
-    except Exception as e:
-        logging.error(f"Error: Please check if the *packer_conf() preprocessing.py* exists and work properly. \n{e}")
-        raise
+    """Create tokenizer from preset."""
+    logging.info("PREPROCESSING: Creating tokenizer ...")
+    return keras_nlp.models.DebertaV3Tokenizer.from_preset(ModelConfiguration.preset)
 
-# get tokens from words
-def get_tokens(words, seq_len, tokenizer, packer):
-    # Tokenize input -> ragged per-word tokens
-    token_words = tf.expand_dims(tokenizer(words), axis=-1)
-    tokens = tf.reshape(token_words, [-1])
-    tokens = packer(tokens)[0][:seq_len]
-    inputs = {"token_ids": tokens, "padding_mask": tokens != 0}
-    return inputs, tokens, token_words
-    #except Exception as e:
-      #  logging.error(f"Error: Please check if the *get_tokens() preprocessing.py* exists and work properly. \n{e}")
-       # raise
+# Label mapping & alignment helpers
 
-# get token ids for tokens
-def get_token_ids(token_words):
-    try:
-        logging.info("PREPROCESSING: Getting token ids ...")
-        # Get word indices
-        word_ids = tf.range(tf.shape(token_words)[0])
-        # Get size of each word
-        word_size = tf.reshape(tf.map_fn(lambda word: tf.shape(word)[0:1], token_words), [-1])
-        # Repeat word_id with size of word to get token_id
-        token_ids = tf.repeat(word_ids, word_size)
-        return token_ids
-    except Exception as e:
-        logging.error(f"Error: Please check if the *get_token_ids() preprocessing.py* exists and work properly. \n{e}")
-        raise
-
-# get token labels
-def get_token_labels(word_labels, token_ids, seq_len):
-    try:
-        logging.info("PREPROCESSING: Getting token labels ...")
-        # Create token_labels from word_labels ->  alignment
-        token_labels = tf.gather(word_labels, token_ids)
-        # Only label the first token of a given word and assign -100 to others
-        mask = tf.concat([[True], token_ids[1:] != token_ids[:-1]], axis=0)
-        token_labels = tf.where(mask, token_labels, -100)
-        # Truncate to max sequence length
-        token_labels = token_labels[: seq_len - 2]  # -2 for special tokens ([CLS], [SEP])
-        # Pad token_labels to align with tokens (use -100 to pad for loss/metric ignore)
-        pad_start = 1  # for [CLS] token
-        pad_end = seq_len - tf.shape(token_labels)[0] - 1  # for [SEP] and [PAD] tokens
-        token_labels = tf.pad(token_labels, [[pad_start, pad_end]], constant_values=-100)
-        return token_labels
-    except Exception as e:
-        logging.error(f"Error: Please check if the *get_token_labels() preprocessing.py* exists and work properly. \n{e}")
-        raise
-
-# add special tokens to define start and end of the sentance
-def process_token_ids(token_ids, seq_len):
-    try:    
-        logging.info("PREPROCESSING: Processing token ids ...")
-        # Truncate to max sequence length
-        token_ids = token_ids[: seq_len - 2]  # -2 for special tokens ([CLS], [SEP])
-        # Pad token_ids to align with tokens (use -1 to pad for later identification)
-        pad_start = 1  # [CLS] token
-        pad_end = seq_len - tf.shape(token_ids)[0] - 1  # [SEP] and [PAD] tokens
-        token_ids = tf.pad(token_ids, [[pad_start, pad_end]], constant_values=-1)
-        return token_ids
-    except Exception as e:
-        logging.error(f"Error: Please check if the *process_token_ids() preprocessing.py* exists and work properly. \n{e}")
-        raise
-
-# tokenize text
-def process_data(seq_len=720, has_label=True, return_ids=False):
-    try:
-        tokenizer = tokenizer_conf()  # EAGER creation
-        packer = keras_nlp.layers.MultiSegmentPacker(
-            start_value=tokenizer.cls_token_id,
-            end_value=tokenizer.sep_token_id,
-            sequence_length=seq_len,
-        )
-
-        def process(x):
-            try:
-                # pass tokenizer & packer into get_tokens
-                inputs, tokens, words_int = get_tokens(x["words"], seq_len, tokenizer, packer)
-                token_ids = get_token_ids(words_int)
-                if has_label:
-                    token_labels = get_token_labels(x["labels"], token_ids, seq_len)
-                    return inputs, token_labels
-                elif return_ids:
-                    token_ids = process_token_ids(token_ids, seq_len)
-                    return token_ids
-                else:
-                    return inputs
-            except Exception as e:
-                logging.error(f"Error: Please check if the *process() into process_data() preprocessing.py* exists and work properly. \n{e}")
-                raise
-
-        return process
-    except Exception as e:
-        logging.error(f"Error: Please check if the *process_data() preprocessing.py* exists and work properly. \n{e}")
-        raise
-
-# DATA LOADING FUNCTION
-def build_dataset(words, labels=None, return_ids=False, batch_size=4,
-                  seq_len=512, shuffle=False, cache=True, drop_remainder=True):
-    try:
-        logging.info("PREPROCESSING: Building dataset ...")
-        AUTO = tf.data.AUTOTUNE 
-
-        slices = {"words": tf.ragged.constant(words)}
-        if labels is not None:
-            slices.update({"labels": tf.ragged.constant(labels)})
-
-        ds = tf.data.Dataset.from_tensor_slices(slices)
-        ds = ds.map(process_data(seq_len=seq_len,
-                                has_label=labels is not None, 
-                                return_ids=return_ids), num_parallel_calls=AUTO) # apply processing
-        ds = ds.cache() if cache else ds  # cache dataset
-        if shuffle: # shuffle dataset
-            ds = ds.shuffle(1024, seed=ModelConfiguration.seed)  
-            opt = tf.data.Options() 
-            opt.experimental_deterministic = False
-            ds = ds.with_options(opt)
-        ds = ds.batch(batch_size, drop_remainder=drop_remainder)  # batch dataset
-        ds = ds.prefetch(AUTO)  # prefetch next batch
-        return ds
-    except Exception as e:
-        logging.error(f"Error: Please check if the *build_dataset() preprocessing.py* exists and work properly. \n{e}")
-        raise
+def map_labels_to_ids(label_seq: List[str]) -> List[int]:
+    """Map string labels to ids; unknowns fall back to 'O'."""
+    l2i = ModelConfiguration.label2id
+    o_id = l2i.get("O", 0)
+    return [l2i.get(lbl, o_id) for lbl in label_seq]
 
 
-# Your data preparation code here
-def preprocess_data(data_path):
-    try:
-        # Set random seed and global policy for reproducibility
-        keras.utils.set_random_seed(ModelConfiguration.seed)      # produce similar result in each run
-        keras.mixed_precision.set_global_policy("mixed_float16")  # enable larger batch sizes and faster training
+def words_to_subtokens_and_labels(
+    words: List[str],
+    word_label_ids: List[int],
+    tokenizer,
+    seq_len: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Convert a sentence (words + word-level label ids) into:
+      token_ids:           (seq_len,)  -> vocab piece ids
+      token_labels:        (seq_len,)  -> -100 on non-first subwords/pad
+      word_ids_per_token:  (seq_len,)  -> word index per subword, -1 for pad
+    """
+    def to_python_list(batch_tokens):
+        # RaggedTensor path
+        if hasattr(batch_tokens, "to_list"):
+            data = batch_tokens.to_list()
+            return data[0] if len(data) else []
+        # Tensor path
+        if tf.is_tensor(batch_tokens):
+            arr = batch_tokens.numpy()
+            if arr.ndim == 2:
+                return arr[0].tolist()
+            return arr.tolist()
+        # Fallback
+        arr = np.array(batch_tokens, dtype=object)
+        if arr.ndim == 2:
+            return arr[0].tolist()
+        return arr.tolist()
 
-        # read data
-        words, labels = read_data(data_path)
+    subtoken_ids: List[int] = []
+    subtoken_labels: List[int] = []
+    word_ids_per_token: List[int] = []
 
-        if ModelConfiguration.train:
-            # split the data
-            train_tokens, valid_tokens, train_labels, valid_labels = train_test_split(
-                words,
-                labels,
-                test_size = 0.3
-            )
+    for w_idx, (w, lab_id) in enumerate(zip(words, word_label_ids)):
+        pieces_rt = tokenizer([w])     # tokenize single word
+        pieces = to_python_list(pieces_rt)
+        if not pieces:
+            continue
 
-            # BUILD TRAIN AND VALID DATALOADER
-            train_ds = build_dataset(train_tokens, train_labels,  batch_size=ModelConfiguration.train_batch_size,
-                                    seq_len=ModelConfiguration.train_seq_len, shuffle=True)
+        subtoken_ids.extend(pieces)
+        # first subword of this word gets the label; others -100
+        subtoken_labels.append(lab_id)
+        if len(pieces) > 1:
+            subtoken_labels.extend([-100] * (len(pieces) - 1))
+        # record the source word index for each subword
+        word_ids_per_token.extend([w_idx] * len(pieces))
 
-            valid_ds = build_dataset(valid_tokens, valid_labels, batch_size=ModelConfiguration.train_batch_size, 
-                                    seq_len=ModelConfiguration.train_seq_len, shuffle=False)
-            return train_ds, valid_ds
-        
+    # truncate
+    subtoken_ids = subtoken_ids[:seq_len]
+    subtoken_labels = subtoken_labels[:seq_len]
+    word_ids_per_token = word_ids_per_token[:seq_len]
+
+    # pad
+    pad = seq_len - len(subtoken_ids)
+    if pad > 0:
+        subtoken_ids.extend([0] * pad)              # 0 is PAD for DeBERTa preset
+        subtoken_labels.extend([-100] * pad)        # ignored by loss/metric
+        word_ids_per_token.extend([-1] * pad)       # -1 marks pad/special
+
+    return (
+        np.array(subtoken_ids, dtype="int32"),
+        np.array(subtoken_labels, dtype="int32"),
+        np.array(word_ids_per_token, dtype="int32"),
+    )
+
+# Corpus -> fixed arrays
+
+def build_arrays(
+    all_words: List[List[str]],
+    all_labels: Optional[List[List[str]]],
+    seq_len: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Convert whole corpus into arrays:
+      token_ids:        (N, seq_len)
+      token_labels:     (N, seq_len)
+      padding_mask:     (N, seq_len)  (1 for real tokens, 0 for pads)
+      word_ids_per_tok: (N, seq_len)  (word index per subword, -1 for pads)
+    """
+    tokenizer = tokenizer_conf()
+
+    N = len(all_words)
+    token_ids = np.zeros((N, seq_len), dtype="int32")
+    token_labels = np.full((N, seq_len), fill_value=-100, dtype="int32")
+    padding_mask = np.zeros((N, seq_len), dtype="int32")
+    word_ids_map = np.full((N, seq_len), fill_value=-1, dtype="int32")
+
+    logging.info("PREPROCESSING: Getting token ids ...")
+    for i in tqdm(range(N)):
+        words = all_words[i]
+        if all_labels is None:
+            # inference path: use "O" over all words for shape compatibility
+            label_ids = [ModelConfiguration.label2id.get("O", 0)] * len(words)
         else:
-            # Get token ids
-            id_ds = build_dataset(words, return_ids=True, batch_size=len(words), 
-                                    seq_len=ModelConfiguration.infer_seq_len, shuffle=False, cache=False, drop_remainder=False)
-            test_token_ids = ops.convert_to_numpy([ids for ids in iter(id_ds)][0])
+            label_ids = map_labels_to_ids(all_labels[i])
 
-            # Build test dataloader
-            test_ds = build_dataset(words, return_ids=False, batch_size=ModelConfiguration.infer_batch_size,
-                                    seq_len=ModelConfiguration.infer_seq_len, shuffle=False, cache=False, drop_remainder=False)
-            return words, labels, test_token_ids, test_ds
-    except Exception as e:
-        logging.error(f"Error: Please check if the *preprocess_data() preprocessing.py* exists and work properly. \n{e}")
-        raise
+        ids_row, lab_row, wids_row = words_to_subtokens_and_labels(
+            words, label_ids, tokenizer, seq_len
+        )
+        token_ids[i] = ids_row
+        token_labels[i] = lab_row
+        padding_mask[i] = (ids_row != 0).astype("int32")
+        word_ids_map[i] = wids_row
+
+    return token_ids, token_labels, padding_mask, word_ids_map
+
+# tf.data Dataset builders
+
+def as_tf_dataset(
+    token_ids: np.ndarray,
+    token_labels: np.ndarray,
+    padding_mask: np.ndarray,
+    batch_size: int,
+    shuffle: bool = False,
+) -> tf.data.Dataset:
+    """
+    Yields: ({'token_ids': ..., 'padding_mask': ...}, labels)
+    """
+    x = {"token_ids": token_ids, "padding_mask": padding_mask}
+    y = token_labels
+
+    ds = tf.data.Dataset.from_tensor_slices((x, y))
+    if shuffle:
+        ds = ds.shuffle(buffer_size=len(token_ids), reshuffle_each_iteration=True)
+    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return ds
+
+
+def as_tf_dataset_infer(
+    token_ids: np.ndarray,
+    padding_mask: np.ndarray,
+    batch_size: int,
+) -> tf.data.Dataset:
+    x = {"token_ids": token_ids, "padding_mask": padding_mask}
+    ds = tf.data.Dataset.from_tensor_slices(x)
+    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return ds
+
+# Class-weight computation (token-level, ignoring -100)
+
+def compute_class_weights(label_ds: tf.data.Dataset, num_labels: int, ignore_label: int = -100):
+    """
+    Estimate class weights from a dataset of (x, y) where y is (B, T).
+    Returns a np.ndarray of shape (num_labels,) normalized to mean ~ 1.
+    """
+    logging.info("PREPROCESSING: Computing class weights (approx) ...")
+    counts = Counter()
+    for _, y in label_ds.take(200):
+        y = y.numpy().reshape(-1)
+        y = y[y != ignore_label]
+        counts.update(y.tolist())
+
+    freq = np.ones(num_labels, dtype=np.float32)
+    for k, v in counts.items():
+        if 0 <= int(k) < num_labels:
+            freq[int(k)] = float(v)
+
+    inv = 1.0 / np.sqrt(freq)
+    inv = inv * (num_labels / inv.sum())
+    return inv
+
+
+# Orchestration
+
+def preprocess_data(data_path: str):
+    """
+    If ModelConfiguration.train:
+        returns (train_ds, val_ds, class_weights)
+    else:
+        returns (words, None, (token_ids, word_ids_map), test_ds)
+    """
+    # lengths / batch sizes
+    seq_len_train = getattr(ModelConfiguration, "train_seq_len", 1024)
+    bs_train = getattr(ModelConfiguration, "train_batch_size", 8)
+    seq_len_val = getattr(ModelConfiguration, "val_seq_len", seq_len_train)
+    bs_val = getattr(ModelConfiguration, "val_batch_size", bs_train)
+
+    # inference overrides if provided
+    if not ModelConfiguration.train:
+        seq_len_val = getattr(ModelConfiguration, "infer_seq_len", seq_len_val)
+        bs_val = getattr(ModelConfiguration, "infer_batch_size", bs_val)
+
+    words, labels = read_data(data_path)
+
+    if ModelConfiguration.train and labels is not None:
+        logging.info("PREPROCESSING: Building dataset ...")
+        w_tr, w_va, l_tr, l_va = train_test_split(
+            words, labels, test_size=0.2, random_state=ModelConfiguration.seed, shuffle=True
+        )
+
+        tr_ids, tr_labs, tr_mask, _ = build_arrays(w_tr, l_tr, seq_len_train)
+        va_ids, va_labs, va_mask, _ = build_arrays(w_va, l_va, seq_len_val)
+
+        train_ds = as_tf_dataset(tr_ids, tr_labs, tr_mask, bs_train, shuffle=True)
+        val_ds   = as_tf_dataset(va_ids, va_labs, va_mask, bs_val, shuffle=False)
+
+        class_weights = compute_class_weights(train_ds, ModelConfiguration.num_labels, ignore_label=-100)
+
+        return train_ds, val_ds, class_weights
+
+    # Inference path (labels can be None)
+    logging.info("PREPROCESSING: Building dataset ...")
+    te_ids, _te_labs, te_mask, te_word_ids = build_arrays(words, labels, seq_len_val)
+    test_ds = as_tf_dataset_infer(te_ids, te_mask, bs_val)
+
+    # Return a tuple compatible with predict.py, plus the word-index map
+    return words, None, (te_ids, te_word_ids), test_ds
+
+
+# Quick check
+
+if __name__ == "__main__":
+    ModelConfiguration.train = True
+    train_ds, val_ds, cw = preprocess_data(InputData.train)
+    xb, yb = next(iter(train_ds))
+    logging.info("Train batch token_ids shape: %s", xb["token_ids"].shape)
+    logging.info("Train batch labels shape: %s", yb.shape)
+    logging.info("Class weights: %s", cw)
