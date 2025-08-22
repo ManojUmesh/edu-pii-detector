@@ -15,15 +15,18 @@ def configure_logging():
         logger.addHandler(fh)
     return logging
 
-# Class to define input data paths
+
+# Data paths
 class InputData:
-    train = "/content/drive/MyDrive/Colab Notebooks/PII-Data-Detection/input/train.json"
-    test = "/content/drive/MyDrive/Colab Notebooks/PII-Data-Detection/input/test.json"
-    sample = "/content/drive/MyDrive/Colab Notebooks/PII-Data-Detection/input/sample_submission.csv"
+    train = "/content/drive/MyDrive/PII-Data-Detection/input/train.json"
+    test =  "/content/drive/MyDrive/PII-Data-Detection/input/test.json"
+    sample = "/content/drive/MyDrive/PII-Data-Detection/input/sample_submission.csv"
+    # When training finishes, training.py will also save a full model here by default.
     save_dir = "/content/drive/MyDrive/Colab Notebooks/PII-Data-Detection/models"
+    # For inference: point to either weights (.h5) or a full model (.keras)
     trained_model = "/content/drive/MyDrive/Colab Notebooks/PII-Data-Detection/models/model.weights.h5"
 
-# Configuration parameters for the model
+
 class ModelConfiguration:
     seed = 2024
     preset = "deberta_v3_small_en"   # KerasNLP preset
@@ -38,7 +41,6 @@ class ModelConfiguration:
     infer_seq_len = 768
     infer_batch_size = 2
     pred_threshold = 0.60
-    
     # Labels / mapping
     labels = [
         "B-USERNAME", "B-ID_NUM", "I-PHONE_NUM", "I-ID_NUM",
@@ -46,8 +48,8 @@ class ModelConfiguration:
         "B-STREET_ADDRESS", "B-URL_PERSONAL", "O",
         "I-URL_PERSONAL", "B-PHONE_NUM", "B-NAME_STUDENT"
     ]
-    id2label = dict(enumerate(labels))# integer values for BIO mapping
+    id2label = dict(enumerate(labels))
     label2id = {v: k for k, v in id2label.items()}
-    num_labels = len(labels) # number of PII tags
-
-    train = True   # whether to train or use already trained
+    num_labels = len(labels)
+    # Switch between train / predict
+    train = True
