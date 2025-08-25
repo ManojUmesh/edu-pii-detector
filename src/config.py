@@ -52,4 +52,4 @@ class ModelConfiguration:
     label2id = {v: k for k, v in id2label.items()}
     num_labels = len(labels)
     # Switch between train / predict
-    train = True
+    train = False
