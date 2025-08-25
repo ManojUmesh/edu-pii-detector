@@ -268,13 +268,26 @@ def make_predictions(model: keras.Model, processed_test_data):
     save_processed_texts(redacted_texts)
     logging.info("PREDICTING: Done!")
 
+def predict():
+    # Make sure we’re in inference mode
+    ModelConfiguration.train = False
+
+    # Build & load model
+    model = build_inference_model()
+    model = load_model_weights_or_model(model)
+
+    # Prepare data and run
+    processed = preprocess_data(InputData.test)
+    make_predictions(model, processed)
+
+    # Return useful info if the caller wants it
+    return {
+        "submission_path": os.path.abspath("submission.csv"),
+        "processed_path": os.path.abspath("processed_data.csv"),
+    }
+
+
 if __name__ == "__main__":
-    try:
-        ModelConfiguration.train = False
-        model = build_inference_model()
-        model = load_model_weights_or_model(model)
-        processed = preprocess_data(InputData.test)
-        make_predictions(model, processed)
-    except Exception as e:
-        logging.error("Prediction failed: %s", e)
-        raise
+    logging.info("Running predict.py as a script.")
+    predict()
+
