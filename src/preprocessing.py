@@ -226,6 +226,43 @@ def compute_class_weights(label_ds: tf.data.Dataset, num_labels: int, ignore_lab
     inv = inv * (num_labels / inv.sum())
     return inv
 
+# preprocess a list of raw texts (TXT/DOCX/PDF/CSV ingestion path)
+
+def preprocess_texts_for_inference(texts: List[str]):
+    """
+    Build exactly what predict.make_predictions() expects for inference on raw texts:
+      returns (words_list, None, (token_ids, word_ids_map), test_ds)
+
+    Each element of `texts` is treated as one document. We split on whitespace to
+    get "words" for your downstream word-index alignment & placeholder logic.
+    """
+    # 1) split to words (per document)
+    words_list: List[List[str]] = [t.split() for t in texts]
+
+    # 2) get tokenizer and lengths
+    tokenizer = tokenizer_conf()
+    seq_len = getattr(ModelConfiguration, "infer_seq_len", getattr(ModelConfiguration, "val_seq_len", 768))
+    o_id = ModelConfiguration.label2id.get("O", 0)
+
+    # 3) build arrays the same way as build_arrays(), but with synthetic 'O' labels
+    N = len(words_list)
+    token_ids = np.zeros((N, seq_len), dtype="int32")
+    word_ids_map = np.full((N, seq_len), fill_value=-1, dtype="int32")
+    padding_mask = np.zeros((N, seq_len), dtype="int32")
+
+    for i, words in enumerate(words_list):
+        dummy_labels = [o_id] * len(words)
+        ids_row, _lab_row, wids_row = words_to_subtokens_and_labels(
+            words, dummy_labels, tokenizer, seq_len
+        )
+        token_ids[i] = ids_row
+        word_ids_map[i] = wids_row
+        padding_mask[i] = (ids_row != 0).astype("int32")
+
+    # 4) pack to tf.data for the model
+    test_ds = as_tf_dataset_infer(token_ids, padding_mask, getattr(ModelConfiguration, "infer_batch_size", 2))
+
+    return words_list, None, (token_ids, word_ids_map), test_ds
 
 # Orchestration
 
@@ -283,3 +320,10 @@ if __name__ == "__main__":
     logging.info("Train batch token_ids shape: %s", xb["token_ids"].shape)
     logging.info("Train batch labels shape: %s", yb.shape)
     logging.info("Class weights: %s", cw)
+
+    # smoke test for raw-text inference path
+    ModelConfiguration.train = False
+    demo_texts = ["Alice called Bob at +1-202-555-0100.", "Email me at jane.doe@example.com please."]
+    words_list, _, (ids, wmap), ds = preprocess_texts_for_inference(demo_texts)
+    logging.info("Raw-text inference — docs: %d  ids: %s  wmap: %s",
+                 len(words_list), ids.shape, wmap.shape)

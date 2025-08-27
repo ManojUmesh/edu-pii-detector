@@ -9,9 +9,11 @@ import tensorflow as tf
 import keras
 import keras_nlp
 import spacy
+import argparse
 
 from config import ModelConfiguration, InputData, configure_logging
-from preprocessing import preprocess_data  # -> (words, None, (token_ids, word_ids_map), test_ds)
+from io_ingest import load_texts
+from preprocessing import preprocess_texts_for_inference, preprocess_data
 
 logging = configure_logging()
 
@@ -268,7 +270,7 @@ def make_predictions(model: keras.Model, processed_test_data):
     save_processed_texts(redacted_texts)
     logging.info("PREDICTING: Done!")
 
-def predict():
+def predict(input_path: str | None = None, csv_text_column: str = "text"):
     # Make sure we’re in inference mode
     ModelConfiguration.train = False
 
@@ -276,18 +278,49 @@ def predict():
     model = build_inference_model()
     model = load_model_weights_or_model(model)
 
-    # Prepare data and run
-    processed = preprocess_data(InputData.test)
+    # Prepare data
+    if input_path:
+        raw_texts = load_texts(input_path, csv_text_column=csv_text_column)
+        processed = preprocess_texts_for_inference(raw_texts)
+    else:
+        processed = preprocess_data(InputData.test)
+
+    # Run predictions
     make_predictions(model, processed)
 
-    # Return useful info if the caller wants it
+    # Return useful paths
     return {
         "submission_path": os.path.abspath("submission.csv"),
         "processed_path": os.path.abspath("processed_data.csv"),
     }
 
-
 if __name__ == "__main__":
-    logging.info("Running predict.py as a script.")
-    predict()
+    try:
+        ModelConfiguration.train = False
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--input_path", type=str, default=None,
+                            help="Path to a .txt/.docx/.pdf/.csv file or a directory of files. "
+                                 "If omitted, will use InputData.test JSON via preprocess_data().")
+        parser.add_argument("--csv_text_column", type=str, default="text",
+                            help="Column name to read from CSV files (default: 'text').")
+        args = parser.parse_args()
+
+        # Build & load model
+        model = build_inference_model()
+        model = load_model_weights_or_model(model)
+
+        if args.input_path:
+            # New free-text path: read raw files -> preprocess for inference
+            raw_texts = load_texts(args.input_path, csv_text_column=args.csv_text_column)
+            processed = preprocess_texts_for_inference(raw_texts)
+        else:
+            # Old path: use your JSON test set
+            processed = preprocess_data(InputData.test)
+
+        make_predictions(model, processed)
+
+    except Exception as e:
+        logging.error("Prediction failed: %s", e)
+        raise
 

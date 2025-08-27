@@ -1,0 +1,7 @@
+ Name: John Adams
+ Email: john.adams@example.edu
+ DOB: 14/09/2001
+ Essay Excerpt:
+ "My experience at New York University has been both challenging and rewarding.
+ My advisor, Dr. Sandra Liu, encouraged me to take risks in my research on
+ climate policy in Washington D.C., which led to several recognitions."
