@@ -5,3 +5,5 @@ keras-nlp==0.13.0
 numpy
 scikit-learn
 tqdm
+python-docx
+pdfplumber
