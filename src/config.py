@@ -18,13 +18,13 @@ def configure_logging():
 
 # Data paths
 class InputData:
-    train = "/home/manoj_umesh/projects/edu-pii-detector/input/train.json"
-    test =  "/home/manoj_umesh/projects/edu-pii-detector/input/test.json"
-    sample = "/home/manoj_umesh/projects/edu-pii-detector/input/sample_submission.csv"
+    train = "/content/drive/MyDrive/edu-pii-detector/input/train.json"
+    test =  "/content/drive/MyDrive/edu-pii-detector/input/test.json"
+    sample = "/content/drive/MyDrive/edu-pii-detector/input/sample_submission.csv"
     # When training finishes, training.py will also save a full model here by default.
     save_dir = "/home/manoj_umesh/projects/edu-pii-detector/models"
     # For inference: point to either weights (.h5) or a full model (.keras)
-    trained_model = "/home/manoj_umesh/projects/edu-pii-detector/models/model.weights.h5"
+    trained_model = "/content/drive/MyDrive/Colab Notebooks/PII-Data-Detection/models/model.weights.h5"
     csv_text_column = "text"
 
 
