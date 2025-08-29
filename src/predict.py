@@ -2,7 +2,7 @@ import os
 import re
 import json
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -72,6 +72,7 @@ SPACY_TO_BIOLABEL = {
     "FAC": "B-STREET_ADDRESS",
 }
 
+
 # Stricter regex:
 EMAIL_TOKEN_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 URL_TOKEN_RE   = re.compile(r"^(https?://|www\.)[^\s]+$", re.IGNORECASE)
@@ -99,17 +100,11 @@ def build_word_spans(words: List[str]) -> List[Tuple[int, int]]:
     return spans
 
 def spacy_regex_word_labels(words: List[str], nlp) -> List[int]:
-    """
-    Conservative per-word labels from spaCy + regex.
-    Priority: spaCy if PERSON/GPE/LOC/FAC; else regex for EMAIL/URL/PHONE.
-    Common words/short words are ignored.
-    """
     out = ["O"] * len(words)
     text = " ".join(words)
     doc = nlp(text)
     spans = build_word_spans(words)
 
-    # spaCy entities
     for ent in doc.ents:
         mapped = SPACY_TO_BIOLABEL.get(ent.label_)
         if not mapped:
@@ -120,7 +115,6 @@ def spacy_regex_word_labels(words: List[str], nlp) -> List[int]:
                 if not looks_like_common_word(words[i]):
                     out[i] = mapped
 
-    # Regex fallbacks for tokens still 'O'
     for i, w in enumerate(words):
         if out[i] != "O": 
             continue
@@ -145,12 +139,6 @@ def first_subtoken_positions_and_probs(y_probs_row: np.ndarray,
                                        num_labels: int,
                                        seq_len: int,
                                        ) -> Tuple[List[int], List[np.ndarray]]:
-    """
-    For each FIRST subtoken of a word (wid_row gives word indices), collect:
-      - its position in the flat sequence
-      - the probability vector y_probs_row[pos, :]
-    Returns aligned lists of equal length.
-    """
     valid = (tok_row != 0)
     probs = y_probs_row[valid]
     wids  = wid_row[valid]
@@ -185,25 +173,54 @@ def save_processed_texts(redacted_texts):
     logging.info("PREDICTING: Writing processed_data.csv ...")
     pd.Series(redacted_texts).to_csv("processed_data.csv", index=False, header=False)
 
+# Helpers to read gold labels for val split
+
+def _load_tokens_labels_from_json(json_path: str):
+    """Reads a JSON/JSONL val file and returns (tokens_list, labels_list)."""
+    with open(json_path, "r", encoding="utf-8") as f:
+        head = f.read(1024)
+        f.seek(0)
+        # JSONL?
+        if "\n" in head.strip():
+            toks, labs = [], []
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                row = json.loads(line)
+                toks.append(row["tokens"])
+                labs.append(row["labels"])
+            return toks, labs
+        # JSON (list or {"data":[...]})
+        data = json.load(f)
+        if isinstance(data, dict) and "data" in data:
+            data = data["data"]
+        toks = [row["tokens"] for row in data]
+        labs = [row["labels"] for row in data]
+        return toks, labs
+
 # Main
 
-def make_predictions(model: keras.Model, processed_test_data, eval_jsonl_out: str | None = None):
+def make_predictions(model: keras.Model,
+                     processed_data_tuple,
+                     eval_jsonl_out: Optional[str] = None,
+                     gold_labels_list: Optional[List[List[str]]] = None):
     """
-    processed_test_data when train=False:
-        words, None, (token_ids, word_ids_map), test_ds
-    Also writes a JSONL with per-token probabilities if eval_jsonl_out is provided.
+    processed_data_tuple should be a 4-tuple:
+        (words_list, labels_list_or_None, (token_ids, word_ids_map), dataset)
+
+    - If labels_list_or_None is provided (validation), they are written to JSONL as labels_true.
+    - If gold_labels_list is provided, it overrides labels_list_or_None.
+    - If neither, labels_true is [].
     """
     global O_ID
-    words_list, _, packed_ids, test_ds = processed_test_data
-    token_ids, word_ids_map = packed_ids  # (N, L), (N, L)
+    words_list, labels_list, packed_ids, dataset = processed_data_tuple
+    token_ids, word_ids_map = packed_ids
     O_ID = ModelConfiguration.label2id.get("O", 0)
 
-    # 1) Predict probabilities
     logging.info("PREDICTING: Running inference ...")
-    probs = model.predict(test_ds, verbose=1)  # (N, L, num_labels)
+    probs = model.predict(dataset, verbose=1)  # (N, L, C)
     preds = np.argmax(probs, axis=-1)
 
-    # spaCy once
     try:
         nlp = spacy.load("en_core_web_sm")
     except OSError:
@@ -212,38 +229,42 @@ def make_predictions(model: keras.Model, processed_test_data, eval_jsonl_out: st
             "Install with: python -m spacy download en_core_web_sm"
         )
 
-    # 2) Per document: model priority + gated overrides
+    if gold_labels_list is not None:
+        logging.info("PREDICTING: Using gold labels from val.json for labels_true.")
+        labels_list = gold_labels_list
+
+    # Sanity checks
+    if labels_list is not None:
+        assert len(labels_list) == len(words_list), \
+            f"Gold labels count ({len(labels_list)}) != sentences ({len(words_list)})"
+        for i, (w, g) in enumerate(zip(words_list, labels_list)):
+            if len(w) != len(g):
+                raise ValueError(f"Sentence {i} mismatch: {len(w)} tokens vs {len(g)} labels")
+
     logging.info("PREDICTING: Post-processing ...")
     doc_ids, token_pos, label_ids, token_strs = [], [], [], []
     redacted_texts = []
-
-    # Optional: collect rows for JSONL eval file
     eval_rows = [] if eval_jsonl_out else None
 
     for doc_idx, (words, y_prob_row, y_pred_row, tok_row, wid_row) in enumerate(
         zip(words_list, probs, preds, token_ids, word_ids_map)
     ):
-        # Model→word (first-subtoken) labels + P(O) per word
         pos_list, prob_vecs = first_subtoken_positions_and_probs(
             y_prob_row, wid_row, tok_row, ModelConfiguration.num_labels, y_prob_row.shape[0]
         )
+
         word_labels_model = [O_ID] * len(words)
-        word_P_O = [1.0] * len(words)  # default
-        # fill from first-subtoken info
-        valid_token_mask = (tok_row != 0)
-        wids_compact = wid_row[valid_token_mask]
+        word_P_O = [1.0] * len(words)
+        valid_mask = (tok_row != 0)
+        wids_compact = wid_row[valid_mask]
         for pos, p in zip(pos_list, prob_vecs):
             widx = int(wids_compact[pos])
             if 0 <= widx < len(words):
                 word_labels_model[widx] = int(np.argmax(p))
                 word_P_O[widx] = float(p[O_ID])
 
-        # spaCy+regex labels
         word_labels_sr = spacy_regex_word_labels(words, nlp)
 
-        # Conservative fusion:
-        # - If model != O → keep model.
-        # - Else (model == O) → take spaCy/regex only if P(O) >= threshold and SR label != O.
         final_labels = []
         for i in range(len(words)):
             m = word_labels_model[i]
@@ -256,29 +277,26 @@ def make_predictions(model: keras.Model, processed_test_data, eval_jsonl_out: st
                 else:
                     final_labels.append(O_ID)
 
-        # Build redacted text
+        # Redacted text
         red_tokens = []
         for i, w in enumerate(words):
             ph = label_id_to_placeholder(final_labels[i])
             red_tokens.append(ph if ph else w)
         redacted_texts.append(" ".join(red_tokens))
 
-        # Submission → all final non-O words
+        # Submission rows (final non-O only)
         for i, li in enumerate(final_labels):
             if li != O_ID:
                 doc_ids.append(doc_idx)
-                token_pos.append(i)        # word index
+                token_pos.append(i)
                 label_ids.append(li)
                 token_strs.append(words[i])
 
-        #JSONL (with per-token probs)
+        # JSONL eval row
         if eval_rows is not None:
-            # Map label IDs back to strings
             pred_labels_str = [ModelConfiguration.id2label[int(li)] for li in final_labels]
-
-            # Align word-level probability vectors using first-subtoken logic
-            # Note: prob_vecs length can be <= number of words
-            word_prob_vectors: List[List[float]] = []
+            # per-word prob vectors (first-subtoken)
+            word_prob_vectors = []
             o_idx = ModelConfiguration.label2id["O"]
             for j in range(len(words)):
                 if j < len(prob_vecs):
@@ -288,18 +306,27 @@ def make_predictions(model: keras.Model, processed_test_data, eval_jsonl_out: st
                     dummy[o_idx] = 1.0
                     word_prob_vectors.append(dummy)
 
+            # labels_true: prefer labels_list if available; else []
+            if labels_list is not None:
+                labels_true = labels_list[doc_idx]
+                # normalize ints -> strings if needed
+                if labels_true and isinstance(labels_true[0], int):
+                    labels_true = [ModelConfiguration.id2label[int(g)] for g in labels_true]
+            else:
+                labels_true = []
+
             eval_rows.append({
                 "tokens": words,
-                "labels_true": [],  # no gold labels here during inference
+                "labels_true": labels_true,
                 "labels_pred": pred_labels_str,
                 "probs": word_prob_vectors
             })
 
-    # Write standard outputs
+    # Standard outputs
     save_submission(doc_ids, token_pos, label_ids, token_strs)
     save_processed_texts(redacted_texts)
 
-    # Write evaluation JSONL if requested
+    # JSONL with probs (and labels_true if available)
     if eval_rows is not None:
         with open(eval_jsonl_out, "w", encoding="utf-8") as f:
             for r in eval_rows:
@@ -308,26 +335,59 @@ def make_predictions(model: keras.Model, processed_test_data, eval_jsonl_out: st
 
     logging.info("PREDICTING: Done!")
 
-def predict(input_path: str | None = None, csv_text_column: str = "text",
-            eval_jsonl_out: str | None = None):
-    # Make sure we’re in inference mode
+def predict(input_path: Optional[str] = None,
+            csv_text_column: str = "text",
+            dataset_split: str = "val",
+            eval_jsonl_out: Optional[str] = None):
+    """
+    dataset_split:
+      - 'val'       : uses InputData.val (expects gold BIO labels) -> labels_true included
+      - 'test'      : uses InputData.test                           -> labels_true empty
+      - 'inference' : uses input_path                               -> labels_true empty
+    """
     ModelConfiguration.train = False
 
-    # Build & load model
     model = build_inference_model()
     model = load_model_weights_or_model(model)
 
-    # Prepare data
-    if input_path:
+    if dataset_split == "inference":
+        if not input_path:
+            raise ValueError("For 'inference' split, --input_path is required.")
         raw_texts = load_texts(input_path, csv_text_column=csv_text_column)
-        processed = preprocess_texts_for_inference(raw_texts)
-    else:
-        processed = preprocess_data(InputData.test)
+        processed = preprocess_texts_for_inference(raw_texts)  # -> (words, None, (tok_ids,wids), ds)
+        gold_labels = None
 
-    # Run predictions
-    make_predictions(model, processed, eval_jsonl_out=eval_jsonl_out)
+    elif dataset_split == "test":
+        processed = preprocess_data(InputData.test)            # -> (words, None, (tok_ids,wids), ds)
+        gold_labels = None
 
-    # Return useful paths
+    else:  # 'val'
+        # First, try to get a pipeline output with labels in slot-1:
+        processed = preprocess_data(InputData.val)             # -> (words, labels_or_None, (tok_ids,wids), ds)
+
+        # If slot-1 is None or empty, robustly read gold labels directly from val.json:
+        need_fallback = (processed[1] is None) or (len(processed[1]) == 0)
+        if need_fallback:
+            logging.info("PREDICTING: preprocess_data returned no labels; loading gold labels from InputData.val")
+            raw_tokens, raw_labels = _load_tokens_labels_from_json(InputData.val)
+
+            # Sanity: sentence counts must match
+            words_list = processed[0]
+            assert len(words_list) == len(raw_labels), \
+                f"val sentences ({len(words_list)}) != gold labels ({len(raw_labels)})"
+            # Optional: verify token counts per sentence (can comment out if your pipeline re-tokenizes)
+            for i, (w, t) in enumerate(zip(words_list, raw_tokens)):
+                if len(w) != len(t):
+                    raise ValueError(f"Sentence {i} tokens mismatch: preprocess={len(w)} vs val.json={len(t)}")
+
+            # Replace labels in slot-1
+            processed = (processed[0], raw_labels, processed[2], processed[3])
+            gold_labels = raw_labels
+        else:
+            gold_labels = processed[1]
+
+    make_predictions(model, processed, eval_jsonl_out=eval_jsonl_out, gold_labels_list=gold_labels)
+
     out = {
         "submission_path": os.path.abspath("submission.csv"),
         "processed_path": os.path.abspath("processed_data.csv"),
@@ -341,28 +401,46 @@ if __name__ == "__main__":
         ModelConfiguration.train = False
 
         parser = argparse.ArgumentParser()
+        parser.add_argument("--dataset_split", type=str, default="val",
+                            choices=["val","test","inference"],
+                            help="Choose data source: 'val' includes labels_true; 'test' and 'inference' do not.")
         parser.add_argument("--input_path", type=str, default=None,
-                            help="Path to a .txt/.docx/.pdf/.csv file or a directory of files. "
-                                 "If omitted, will use InputData.test JSON via preprocess_data().")
+                            help="For 'inference' split: path to a .txt/.docx/.pdf/.csv or directory.")
         parser.add_argument("--csv_text_column", type=str, default="text",
-                            help="Column name to read from CSV files (default: 'text').")
+                            help="Column name for CSV inference input (default: 'text').")
         parser.add_argument("--eval_jsonl_out", type=str, default="val_predictions_bert.jsonl",
-                            help="Where to write sentence-level JSONL with per-token probabilities for evaluation.")
+                            help="Where to write JSONL with per-token probabilities (and labels_true when available).")
         args = parser.parse_args()
 
-        # Build & load model
         model = build_inference_model()
         model = load_model_weights_or_model(model)
 
-        # Prepare data
-        if args.input_path:
+        if args.dataset_split == "inference":
+            if not args.input_path:
+                raise ValueError("For 'inference', provide --input_path.")
             raw_texts = load_texts(args.input_path, csv_text_column=args.csv_text_column)
             processed = preprocess_texts_for_inference(raw_texts)
-        else:
+            gold_labels = None
+        elif args.dataset_split == "test":
             processed = preprocess_data(InputData.test)
+            gold_labels = None
+        else:  # 'val'
+            processed = preprocess_data(InputData.val)
+            if (processed[1] is None) or (len(processed[1]) == 0):
+                logging.info("PREDICTING: preprocess_data returned no labels; loading gold labels from InputData.val")
+                raw_tokens, raw_labels = _load_tokens_labels_from_json(InputData.val)
+                words_list = processed[0]
+                assert len(words_list) == len(raw_labels), \
+                    f"val sentences ({len(words_list)}) != gold labels ({len(raw_labels)})"
+                for i, (w, t) in enumerate(zip(words_list, raw_tokens)):
+                    if len(w) != len(t):
+                        raise ValueError(f"Sentence {i} tokens mismatch: preprocess={len(w)} vs val.json={len(t)}")
+                processed = (processed[0], raw_labels, processed[2], processed[3])
+                gold_labels = raw_labels
+            else:
+                gold_labels = processed[1]
 
-        # Predict + write outputs
-        make_predictions(model, processed, eval_jsonl_out=args.eval_jsonl_out)
+        make_predictions(model, processed, eval_jsonl_out=args.eval_jsonl_out, gold_labels_list=gold_labels)
 
     except Exception as e:
         logging.error("Prediction failed: %s", e)

@@ -26,6 +26,7 @@ class InputData:
     # For inference: point to either weights (.h5) or a full model (.keras)
     trained_model = "/content/drive/MyDrive/Colab Notebooks/PII-Data-Detection/models/model.weights.h5"
     csv_text_column = "text"
+    val   = '/content/drive/MyDrive/edu-pii-detector/input/val.json'
 
 
 class ModelConfiguration:
