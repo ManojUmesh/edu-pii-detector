@@ -57,7 +57,12 @@ def main():
     logging.info("MAIN: Prediction mode (ModelConfiguration.train=False).")
     ModelConfiguration.train = False
 
-    paths = predict(input_path=args.input, csv_text_column=args.csv_text_column)
+    dataset_split = "inference" if args.input else "test"
+    paths = predict(
+    input_path=args.input,
+    csv_text_column=args.csv_text_column,
+    dataset_split=dataset_split,
+    )
     logging.info(
         "MAIN: Prediction complete.\n"
         f" - submission.csv    -> {paths['submission_path']}\n"
